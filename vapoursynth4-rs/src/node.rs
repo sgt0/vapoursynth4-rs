@@ -8,7 +8,11 @@ mod dependency;
 mod filter;
 pub(crate) mod internal;
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crate::{
     AudioInfo, VideoInfo,
@@ -18,6 +22,7 @@ use crate::{
     frame::{AudioFrame, Frame, FrameContext, VideoFrame, internal::FrameFromPtr},
     node::internal::FilterExtern,
 };
+use futures_core::Stream;
 
 pub use dependency::*;
 pub use filter::*;
@@ -66,12 +71,9 @@ pub trait Node: Sized + Send + Sync + crate::_private::Sealed {
 
     /// Requests the asynchronous generation of a frame.
     ///
-    /// Returns a [Future] that resolves to the requested frame, or the error
-    /// message that was thrown when rendering the frame.
-    fn get_frame_async(
-        &self,
-        n: i32,
-    ) -> impl Future<Output = Result<Self::FrameType, CString>> + Send {
+    /// Returns a [`FrameRequest`] that resolves to the rendered frame, or to
+    /// the error message thrown while rendering it.
+    fn get_frame_async(&self, n: i32) -> FrameRequest<Self::FrameType> {
         let (sender, receiver) = async_channel::bounded(1);
         let payload = Box::new(FrameDonePayload {
             sender,
@@ -86,12 +88,7 @@ pub trait Node: Sized + Send + Sync + crate::_private::Sealed {
             );
         }
 
-        async move {
-            receiver
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err(c"async frame request was cancelled".into()))
-        }
+        FrameRequest(receiver)
     }
 }
 
@@ -132,6 +129,69 @@ unsafe extern "system-unwind" fn frame_done_callback<F: Frame>(
     // The receiver may already be gone if the future was dropped. In that case
     // the frame is freed as `result` is dropped here.
     let _ = payload.sender.try_send(result);
+}
+
+/// A pending frame requested with [`Node::get_frame_async`].
+#[derive(Debug, Clone)]
+pub struct FrameRequest<F: Frame>(async_channel::Receiver<Result<F, CString>>);
+
+impl<F: Frame> FrameRequest<F> {
+    /// Returns the frame if it has finished rendering.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<Result<F, CString>> {
+        self.0.try_recv().ok()
+    }
+
+    /// Blocks the current thread until the frame has finished rendering.
+    ///
+    /// # Blocking
+    ///
+    /// This method will block the current thread until the frame is finished
+    /// rendering. It should not be used in an asynchronous context. Calling
+    /// this in an asynchronous context may result in deadlocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error message thrown while rendering the frame, or a
+    /// cancellation message if the request was dropped before completion.
+    pub fn recv_blocking(self) -> Result<F, CString> {
+        self.0.recv_blocking().unwrap_or_else(|_| Err(cancelled()))
+    }
+}
+
+impl<F: Frame> Future for FrameRequest<F> {
+    type Output = Result<F, CString>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // `Receiver` is `!Unpin` and pins its own wakeup listener across polls,
+        // so the receiver is structurally pinned and driven through its
+        // `Stream`.
+        let rx = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        match rx.poll_next(cx) {
+            Poll::Ready(Some(result)) => Poll::Ready(result),
+            Poll::Ready(None) => Poll::Ready(Err(cancelled())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(test)]
+const _: fn() = || {
+    // `FrameRequest` must be storable as an owned, spawnable future: `Send`,
+    // `'static`, and coercible to a boxed trait object without borrowing a
+    // node.
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_static::<FrameRequest<VideoFrame>>();
+    assert_send_static::<FrameRequest<AudioFrame>>();
+    let _: fn(
+        FrameRequest<VideoFrame>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<VideoFrame, CString>> + Send>> =
+        |r| Box::pin(r);
+};
+
+/// Error returned when a frame request is dropped before the frame is delivered.
+fn cancelled() -> CString {
+    c"async frame request was cancelled".into()
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
