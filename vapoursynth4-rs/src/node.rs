@@ -8,7 +8,7 @@ mod dependency;
 mod filter;
 pub(crate) mod internal;
 
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 use crate::{
     AudioInfo, VideoInfo,
@@ -21,7 +21,6 @@ use crate::{
 
 pub use dependency::*;
 pub use filter::*;
-use vapoursynth4_sys::VSFrameDoneCallback;
 
 pub trait Node: Sized + Send + Sync + crate::_private::Sealed {
     type FrameType: Frame;
@@ -65,18 +64,74 @@ pub trait Node: Sized + Send + Sync + crate::_private::Sealed {
         }
     }
 
-    // TODO: Find a better way to handle callbacks
-    /// # Safety
+    /// Requests the asynchronous generation of a frame.
     ///
-    /// The caller must ensure that:
-    /// - `data` is a valid pointer to the data needed by the callback
-    /// - `callback` is a valid function pointer that safely handles the frame data
-    /// - The callback and data remain valid until the frame processing is complete
-    unsafe fn get_frame_async(&self, n: i32, data: *mut c_void, callback: VSFrameDoneCallback) {
+    /// Returns a [Future] that resolves to the requested frame, or the error
+    /// message that was thrown when rendering the frame.
+    fn get_frame_async(
+        &self,
+        n: i32,
+    ) -> impl Future<Output = Result<Self::FrameType, CString>> + Send {
+        let (sender, receiver) = async_channel::bounded(1);
+        let payload = Box::new(FrameDonePayload {
+            sender,
+            api: self.api(),
+        });
         unsafe {
-            (self.api().getFrameAsync)(n, self.as_ptr(), callback, data);
+            (self.api().getFrameAsync)(
+                n,
+                self.as_ptr(),
+                frame_done_callback::<Self::FrameType>,
+                Box::into_raw(payload).cast(),
+            );
+        }
+
+        async move {
+            receiver
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err(c"async frame request was cancelled".into()))
         }
     }
+}
+
+/// Contains what [`frame_done_callback`] needs.
+struct FrameDonePayload<F: Frame> {
+    sender: async_channel::Sender<Result<F, CString>>,
+    api: Api,
+}
+
+/// Callback invoked by the core when an asynchronously requested frame is
+/// ready.
+///
+/// # Safety
+///
+/// `user_data` must own a `Box<FrameDonePayload<F>>`, and this must run at most
+/// once for it. `F` must be the frame type produced by the node the request was
+/// made on.
+unsafe extern "system-unwind" fn frame_done_callback<F: Frame>(
+    user_data: *mut c_void,
+    f: *const ffi::VSFrame,
+    _n: c_int,
+    _node: *mut ffi::VSNode,
+    error_msg: *const c_char,
+) {
+    let payload = unsafe { Box::from_raw(user_data.cast::<FrameDonePayload<F>>()) };
+
+    let result = if f.is_null() {
+        let msg = if error_msg.is_null() {
+            CString::default()
+        } else {
+            unsafe { CStr::from_ptr(error_msg).into() }
+        };
+        Err(msg)
+    } else {
+        Ok(unsafe { F::from_ptr(f, payload.api) })
+    };
+
+    // The receiver may already be gone if the future was dropped. In that case
+    // the frame is freed as `result` is dropped here.
+    let _ = payload.sender.try_send(result);
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
