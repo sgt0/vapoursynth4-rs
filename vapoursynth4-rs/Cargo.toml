@@ -12,7 +12,7 @@ repository = "https://github.com/inflation/vapoursynth4-rs"
 [dependencies]
 async-channel = "2.5.0"
 bon = "3.8.2"
-futures-core = "0.3.34"
+futures-core = "0.3.33"
 thiserror = "2.0.18"
 vapoursynth4-sys = { version = "0.3.2", path = "../vapoursynth4-sys"}
 
